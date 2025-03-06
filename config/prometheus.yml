@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+scrape_configs:
+  # Spark Monitoring
+  - job_name: 'spark'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['spark-master:4040', 'spark-worker:4040']
+
+  # Kafka JMX Exporter
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka:9998']
+    
+  # Application Metrics
+  - job_name: 'data-quality'
+    static_configs:
+      - targets: ['dlq-consumer:8000']
+
+  # Airflow Monitoring
+  - job_name: 'airflow'
+    metrics_path: '/admin/metrics/'
+    static_configs:
+      - targets: ['airflow-webserver:8080']

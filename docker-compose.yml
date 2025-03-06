@@ -1,0 +1,274 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - data-pipeline
+    healthcheck:
+      test: ["CMD", "zkOk.sh"]
+      interval: 10s
+      timeout: 5s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    ports:
+      - "9092:9092"
+      - "9998:9998"
+      - "9999:9999"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_JMX_OPTS: >
+        -Dcom.sun.management.jmxremote
+        -Dcom.sun.management.jmxremote.authenticate=false
+        -Dcom.sun.management.jmxremote.ssl=false
+        -Dcom.sun.management.jmxremote.port=9999
+        -Dcom.sun.management.jmxremote.rmi.port=9999
+        -Djava.rmi.server.hostname=kafka
+    volumes:
+      - ./jmx_prometheus_javaagent.jar:/usr/share/java/kafka/jmx_prometheus_javaagent.jar
+      - ./config/kafka-jmx-exporter.yml:/etc/kafka/jmx-exporter.yml
+    command: >
+      bash -c "
+      export KAFKA_OPTS='-javaagent:/usr/share/java/kafka/jmx_prometheus_javaagent.jar=9998:/etc/kafka/jmx-exporter.yml';
+      /etc/confluent/docker/run"
+    networks:
+      - data-pipeline
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  setup:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      - kafka
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: /bin/sh -c "sleep 30 && /scripts/create-topics.sh"
+    networks:
+      - data-pipeline
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - data-pipeline
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+    networks:
+      - data-pipeline
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+    image: bitnami/spark:3.5
+    secrets:
+      - aws_config
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_METRICS_ON=prometheus
+      - SPARK_PROMETHEUS_PORT=4040
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    networks:
+      - data-pipeline
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    secrets:
+      - aws_config
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+      - SPARK_METRICS_ON=prometheus
+      - SPARK_PROMETHEUS_PORT=4040
+    depends_on:
+      - spark-master
+    networks:
+      - data-pipeline
+
+  postgres:
+    image: postgres:13
+    secrets:
+      - postgres_config
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data-pipeline
+
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data-pipeline
+
+  airflow-init:
+    image: apache/airflow:2.8.1
+    secrets:
+      - postgres_config
+      - airflow_config
+      - aws_config
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./scripts:/scripts
+    entrypoint: /bin/bash -c "/scripts/init_airflow.sh"
+    networks:
+      - data-pipeline
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    secrets:
+      - postgres_config
+      - airflow_config
+      - aws_config
+    depends_on:
+      - postgres
+      - redis
+      - airflow-init
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    command: scheduler
+    networks:
+      - data-pipeline
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    ports:
+      - "8080:8080"
+    secrets:
+      - postgres_config
+      - airflow_config
+      - aws_config
+    depends_on:
+      - postgres
+      - redis
+      - airflow-init
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    command: webserver
+    networks:
+      - data-pipeline
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    environment:
+      - discovery.type=single-node
+    ports:
+      - "9200:9200"
+    networks:
+      - data-pipeline
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:7.17.0
+    volumes:
+      - ./config/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    environment:
+      - LS_JAVA_OPTS=-Xmx256m -Xms256m
+    networks:
+      - data-pipeline
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9600"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.0
+    ports:
+      - "5601:5601"
+    networks:
+      - data-pipeline
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5601"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dlq-consumer:
+    build: .
+    ports:
+      - "8000:8000"
+    secrets:
+      - aws_config
+    environment:
+      KAFKA_BROKER: kafka:29092
+    networks:
+      - data-pipeline
+    depends_on:
+      - kafka
+      - postgres
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  data-pipeline:
+    driver: bridge
+
+secrets:
+  postgres_config:
+    file: ./secrets/postgres_secrets.env
+  airflow_config:
+    file: ./secrets/airflow_secrets.env
+  aws_config:
+    file: ./secrets/aws_secrets.env

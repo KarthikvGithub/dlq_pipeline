@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+      "json": {
+          "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+          "format": "%(asctime)s %(levelname)s %(message)s %(module)s %(lineno)d"
+      }
+  },
+  "handlers": {
+      "console": {
+          "class": "logging.StreamHandler",
+          "formatter": "json",
+          "stream": "ext://sys.stdout"
+      },
+      "logstash": {
+          "class": "logging.handlers.SocketHandler",
+          "host": "logstash",
+          "port": 5000,
+          "formatter": "json"
+      }
+  },
+  "root": {
+      "level": "INFO",
+      "handlers": ["console", "logstash"]
+  }
+}

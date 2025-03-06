@@ -1,0 +1,21 @@
+lowercaseOutputName: true
+rules:
+  # Kafka Server Metrics
+  - pattern: 'kafka.server<type=(.+), name=(.+)PerSec\w*><>Count'
+    name: kafka_server_$1_$2_total
+    type: COUNTER
+  
+  # Topic-level Metrics
+  - pattern: 'kafka.server<type=(.+), name=(.+)PerSec\w*, topic=(.+)><>Count'
+    name: kafka_server_$1_$2_total
+    type: COUNTER
+    labels:
+      topic: "$3"
+  
+  # Partition Metrics
+  - pattern: 'kafka.log<type=Log, name=Size, topic=(.+), partition=(.+)><>Value'
+    name: kafka_log_size_bytes
+    type: GAUGE
+    labels:
+      topic: "$1"
+      partition: "$2"
