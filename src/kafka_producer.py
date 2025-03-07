@@ -4,6 +4,8 @@ import time
 import random
 import logging
 import boto3
+import pyarrow.csv as pv
+import pyarrow as pa
 from confluent_kafka import Producer
 from botocore.exceptions import ClientError
 import pandas as pd
@@ -73,41 +75,54 @@ def corrupt_record(record: Dict, plan: Dict) -> Dict:
 
 def load_data() -> pd.DataFrame:
     """Load data from S3 or local file with efficient parsing."""
+    dtypes = {
+        'VendorID': 'int8',
+        'passenger_count': 'int8',
+        'RateCodeID': 'int8',
+        'payment_type': 'int8',
+        'store_and_fwd_flag': 'category'
+    }
+    aws_credentials = parse_aws_config()
     try:
-        # Try S3 first
-        aws_credentials = parse_aws_config()
-        s3 = boto3.client('s3',
-            aws_access_key_id=aws_credentials['AWS_ACCESS_KEY_ID'],
-            aws_secret_access_key=aws_credentials['AWS_SECRET_ACCESS_KEY']
-        )
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
+        # Optimized S3 loading with smart_open
+        from smart_open import open
+        s3_uri = f"s3://{S3_BUCKET}/{S3_KEY}"
+        
+        # Use pyarrow for faster CSV parsing
         return pd.read_csv(
-            obj['Body'],
-            parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
-            dtype={
-                'VendorID': 'Int8',
-                'passenger_count': 'Int8',
-                'RateCodeID': 'Int8',
-                'payment_type': 'Int8'
-            }
+            open(s3_uri, 'rb', transport_params={
+                'client': boto3.client('s3',
+                    aws_access_key_id=aws_credentials['AWS_ACCESS_KEY_ID'],
+                    aws_secret_access_key=aws_credentials['AWS_SECRET_ACCESS_KEY']
+                )
+            }),
+            dtype=dtypes,
+            # parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+            low_memory=False,
+            nrows=MAX_RECORDS  # Read only needed rows upfront
         )
-    except ClientError as e:
-        logger.warning(f"Failed S3 fetch: {e}, trying local file")
+    except Exception as s3_error:
+        logger.warning(f"S3 load failed: {s3_error}, trying local")
+        
+        # Memory-mapped local file loading
         return pd.read_csv(
             LOCAL_CSV_PATH,
-            parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
-            dtype={
-                'VendorID': 'Int8',
-                'passenger_count': 'Int8',
-                'RateCodeID': 'Int8',
-                'payment_type': 'Int8'
-            }
+            dtype=dtypes,
+            # parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+            memory_map=True,  # Use memory mapping for faster I/O
+            low_memory=False,
+            nrows=MAX_RECORDS
         )
+    
 
 def produce_messages():
     """Main production loop with batch processing."""
     # Load and prepare data
+
+    print("Loading Data...")
     df = load_data().head(MAX_RECORDS)
+    print("Loaded..")
+
     records = df.to_dict('records')
     corruption_plan = generate_corruption_plan(len(records))
     

@@ -39,8 +39,7 @@ def process_stream():
     # Parse JSON with schema
     parsed_df = kafka_stream.select(
         F.from_json(F.col("value").cast("string"), spark_schema).alias("data")
-        .select("data.*")
-    )
+    ).select("data.*")
 
     # Apply data corrections
     corrected_df = apply_corrections(parsed_df)

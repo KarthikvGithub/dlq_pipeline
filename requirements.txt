@@ -8,6 +8,8 @@ jsonschema
 kagglehub
 pyspark
 Requests
+smart_open
+pyarrow
 apache-airflow
 apache-airflow-providers-amazon
 apache-airflow-providers-postgres
