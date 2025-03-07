@@ -9,6 +9,11 @@ services:
       test: ["CMD", "zkOk.sh"]
       interval: 10s
       timeout: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 256M
 
   kafka:
     image: confluentinc/cp-kafka:7.4.0
@@ -46,6 +51,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 1G
 
   setup:
     image: confluentinc/cp-kafka:7.4.0
@@ -53,7 +63,7 @@ services:
       - kafka
     volumes:
       - ./scripts:/scripts
-    entrypoint: /bin/sh -c "sleep 30 && /scripts/create-topics.sh"
+    entrypoint: /bin/sh -c "sleep 30 && /scripts/create_topics.sh"
     networks:
       - data-pipeline
 
@@ -70,6 +80,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 256M
 
   grafana:
     image: grafana/grafana:latest
@@ -86,6 +101,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 256M
 
   spark-master:
     image: bitnami/spark:3.5
@@ -104,6 +124,11 @@ services:
       - "7077:7077"
     networks:
       - data-pipeline
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 1G
 
   spark-worker:
     image: bitnami/spark:3.5
@@ -120,11 +145,22 @@ services:
       - spark-master
     networks:
       - data-pipeline
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1.5G
 
   postgres:
     image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
     secrets:
       - postgres_config
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U airflow"]
       interval: 5s
@@ -132,6 +168,11 @@ services:
       retries: 5
     networks:
       - data-pipeline
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 800M
 
   redis:
     image: redis:latest
@@ -145,8 +186,24 @@ services:
     networks:
       - data-pipeline
 
+  db-init:
+    image: postgres:13
+    depends_on:
+      - postgres
+    volumes:
+      - ./database/migrations:/migrations
+      - ./scripts/run_migrations.sh:/docker-entrypoint-initdb.d/run_migrations.sh
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_DB: airflow
+    secrets:
+      - postgres_config
+    command: ["bash", "-c", "chmod +x /docker-entrypoint-initdb.d/run_migrations.sh && /docker-entrypoint-initdb.d/run_migrations.sh"]
+
   airflow-init:
-    image: apache/airflow:2.8.1
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow
     secrets:
       - postgres_config
       - airflow_config
@@ -154,16 +211,28 @@ services:
     depends_on:
       - postgres
       - redis
+      - db-init
+    user: "50000:0"
+    environment:
+      AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: "false"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_UID: 50000
+      AIRFLOW_GID: 0
+      PYTHONPATH: ${PYTHONPATH:-/opt/airflow/src}
     volumes:
-      - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
+      - ./logs:/logs
+      - ./airflow/dags:/opt/airflow/dags
       - ./scripts:/scripts
+      - ./src:/opt/airflow/src
     entrypoint: /bin/bash -c "/scripts/init_airflow.sh"
     networks:
       - data-pipeline
 
   airflow-scheduler:
-    image: apache/airflow:2.8.1
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow
     secrets:
       - postgres_config
       - airflow_config
@@ -172,15 +241,24 @@ services:
       - postgres
       - redis
       - airflow-init
+    user: "50000:0"
+    environment:
+      AIRFLOW_UID: 50000
+      AIRFLOW_GID: 0
+      PYTHONPATH: ${PYTHONPATH:-/opt/airflow/src}
     volumes:
+      - ./logs:/logs
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
+      - ./src:/opt/airflow/src
     command: scheduler
     networks:
       - data-pipeline
 
   airflow-webserver:
-    image: apache/airflow:2.8.1
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow
     ports:
       - "8080:8080"
     secrets:
@@ -191,12 +269,25 @@ services:
       - postgres
       - redis
       - airflow-init
+    user: "50000:0"
+    environment:
+      AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL: "300"
+      AIRFLOW_UID: 50000
+      AIRFLOW_GID: 0
+      PYTHONPATH: ${PYTHONPATH:-/opt/airflow/src}
     volumes:
+      - ./logs:/logs
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
+      - ./src:/opt/airflow/src
     command: webserver
     networks:
       - data-pipeline
+    deploy:
+      resources:
+        limits:
+          cpus: '0.4'
+          memory: 800M
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
@@ -211,6 +302,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.8'
+          memory: 1G
 
   logstash:
     image: docker.elastic.co/logstash/logstash:7.17.0
@@ -227,6 +323,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 256M
 
   kibana:
     image: docker.elastic.co/kibana/kibana:7.17.0
@@ -241,6 +342,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 256M
 
   dlq-consumer:
     build: .
@@ -255,6 +361,8 @@ services:
     depends_on:
       - kafka
       - postgres
+    volumes:
+      - ./logs:/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000"]
       interval: 10s
@@ -267,8 +375,11 @@ networks:
 
 secrets:
   postgres_config:
-    file: ./secrets/postgres_secrets.env
+    file: ./secrets/postgres.env
   airflow_config:
-    file: ./secrets/airflow_secrets.env
+    file: ./secrets/airflow.env
   aws_config:
-    file: ./secrets/aws_secrets.env
+    file: ./secrets/aws.env
+
+volumes:
+  postgres-data:

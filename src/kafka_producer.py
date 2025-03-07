@@ -1,121 +1,152 @@
 import json
+import os
 import time
 import random
+import logging
 import boto3
-import csv
 from confluent_kafka import Producer
 from botocore.exceptions import ClientError
-from typing import Dict, Any
+import pandas as pd
+from utils import parse_aws_config
+from typing import Dict, Any, List
 
-# Kafka configuration
-KAFKA_BROKER = "kafka:29092"
-TOPIC = "nyc_taxi_stream"
-S3_BUCKET = "nyc-taxi-dlq-data"
-S3_KEY = "raw/yellow_tripdata_2015-01.csv"
-LIMIT = 10000  # Max records to send
-FAILURE_PROBABILITY = 0.01  # 1% failure rate
-LOCAL_CSV_PATH = "./data/yellow_tripdata_2015-01.csv"
+# Configure logging
+logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Initialize Kafka producer
-producer = Producer({
+# Configuration from environment variables
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:29092")
+TOPIC = os.getenv("KAFKA_TOPIC", "nyc_taxi_stream")
+S3_BUCKET = os.getenv("S3_BUCKET", "dlq-pipeline-source-data")
+S3_KEY = os.getenv("S3_KEY", "raw/yellow_tripdata_2016-03.csv")
+LOCAL_CSV_PATH = os.getenv("LOCAL_CSV_PATH", "./data/yellow_tripdata_2015-01.csv")
+MAX_RECORDS = 100000
+FAILURE_RATE = 0.01
+BATCH_SIZE = 1000
+
+# Initialize Kafka producer with optimized settings
+producer_config = {
     'bootstrap.servers': KAFKA_BROKER,
     'enable.idempotence': True,
     'acks': 'all',
-    'retries': 3
-})
+    'retries': 5,
+    'compression.type': 'lz4',
+    'batch.num.messages': 10000,
+    'queue.buffering.max.messages': 100000,
+    'queue.buffering.max.ms': 500
+}
+
+producer = Producer(producer_config)
 
 def delivery_report(err, msg):
     """Callback for message delivery reports."""
     if err:
-        print(f"Message delivery failed: {err}")
+        logger.error(f"Message delivery failed: {err}")
     else:
-        print(f"Message delivered to {msg.topic()} [{msg.partition()}]")
+        logger.debug(f"Delivered to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
 
-def introduce_failure(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Introduce failure in 1% of records."""
-    if random.random() > FAILURE_PROBABILITY:
-        return row  # 99% valid records
+def generate_corruption_plan(num_records: int) -> List[Dict]:
+    """Pre-generate corruption patterns for batch processing."""
+    return [{
+        'corrupt': random.random() < FAILURE_RATE,
+        'type': random.choice(["missing_field", "invalid_value"]),
+        'field': random.choice([
+            'VendorID', 'passenger_count', 'trip_distance', 
+            'fare_amount', 'total_amount', 'payment_type'
+        ])
+    } for _ in range(num_records)]
 
-    failure_type = random.choice(["missing_field", "invalid_value"])
+def corrupt_record(record: Dict, plan: Dict) -> Dict:
+    """Apply corruption based on pre-generated plan."""
+    if not plan['corrupt']:
+        return record
     
-    if failure_type == "missing_field":
-        row.pop(random.choice(list(row.keys())), None)
-    elif failure_type == "invalid_value":
-        field = random.choice(list(row.keys()))
-        if isinstance(row[field], (int, float)):
-            row[field] = -abs(row[field])
+    if plan['type'] == "missing_field":
+        record.pop(plan['field'], None)
+    else:
+        if isinstance(record.get(plan['field']), (int, float)):
+            record[plan['field']] = -abs(record[plan['field']])
         else:
-            row[field] = "invalid_value"
+            record[plan['field']] = "invalid_value"
     
-    return row
+    return record
 
-def infer_type(value: str) -> Any:
-    """Infer the type of a CSV value."""
-    if not value.strip():
-        return None
-    
+def load_data() -> pd.DataFrame:
+    """Load data from S3 or local file with efficient parsing."""
     try:
-        # Try integer first
-        return int(value)
-    except ValueError:
-        try:
-            # Try float if integer fails
-            return float(value)
-        except ValueError:
-            # Return as string if all else fails
-            return value.strip()
-
-def convert_row_types(row: Dict[str, str]) -> Dict[str, Any]:
-    """Convert CSV string values to inferred types."""
-    return {k: infer_type(v) for k, v in row.items()}
-
-def get_s3_object() -> list:
-    """Fetch CSV data from S3."""
-    s3 = boto3.client('s3')
-    try:
+        # Try S3 first
+        aws_credentials = parse_aws_config()
+        s3 = boto3.client('s3',
+            aws_access_key_id=aws_credentials['AWS_ACCESS_KEY_ID'],
+            aws_secret_access_key=aws_credentials['AWS_SECRET_ACCESS_KEY']
+        )
         obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
-        return obj['Body'].read().decode('utf-8').splitlines()
+        return pd.read_csv(
+            obj['Body'],
+            parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+            dtype={
+                'VendorID': 'Int8',
+                'passenger_count': 'Int8',
+                'RateCodeID': 'Int8',
+                'payment_type': 'Int8'
+            }
+        )
     except ClientError as e:
-        print(f"Failed to fetch S3 object: {e}")
-        raise
-        
-def get_local_csv_data() -> list:
-    """Read CSV data from a local file."""
-    try:
-        with open(LOCAL_CSV_PATH, mode="r") as file:
-            return list(csv.DictReader(file))
-    except Exception as e:
-        print(f"Failed to read local CSV file: {e}")
-        raise
+        logger.warning(f"Failed S3 fetch: {e}, trying local file")
+        return pd.read_csv(
+            LOCAL_CSV_PATH,
+            parse_dates=['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+            dtype={
+                'VendorID': 'Int8',
+                'passenger_count': 'Int8',
+                'RateCodeID': 'Int8',
+                'payment_type': 'Int8'
+            }
+        )
 
 def produce_messages():
-    count = 0
-    # lines = get_s3_object()
-    # reader = csv.DictReader(lines)
-    reader = get_local_csv_data()
+    """Main production loop with batch processing."""
+    # Load and prepare data
+    df = load_data().head(MAX_RECORDS)
+    records = df.to_dict('records')
+    corruption_plan = generate_corruption_plan(len(records))
     
-    for row in reader:
-        if count >= LIMIT:
-            break
-
-        # Convert types and clean data
-        converted_row = convert_row_types(row)
-        corrupted_row = introduce_failure(converted_row)
+    start_time = time.time()
+    produced_count = 0
+    
+    try:
+        for i, (record, plan) in enumerate(zip(records, corruption_plan)):
+            # Apply corruption
+            corrupted = corrupt_record(record, plan)
+            
+            # Serialize and produce
+            producer.produce(
+                topic=TOPIC,
+                value=json.dumps(corrupted),
+                callback=delivery_report
+            )
+            
+            # Batch control
+            if (i + 1) % BATCH_SIZE == 0:
+                producer.poll(0.1)
+                logger.info(f"Produced {i+1} records ({((i+1)/len(records))*100:.1f}%)")
+                
+            produced_count = i + 1
+            
+    except KeyboardInterrupt:
+        logger.warning("Producer interrupted by user")
+    finally:
+        # Cleanup
+        remaining = producer.flush(10)
+        logger.info(f"Flushed {remaining} remaining messages")
         
-        producer.produce(
-            topic=TOPIC,
-            value=json.dumps(corrupted_row),
-            callback=delivery_report
-        )
-        
-        if count % 1000 == 0:
-            producer.flush()
-        
-        time.sleep(0.01)
-        count += 1
-
-    producer.flush()
-    print(f"✅ Sent {count} records from s3://{S3_BUCKET}/{S3_KEY} to Kafka.")
+        duration = time.time() - start_time
+        logger.info(f"""
+            Production summary:
+            - Total records: {produced_count}
+            - Duration: {duration:.2f} seconds
+            - Throughput: {produced_count/duration:.2f} msg/sec
+        """)
 
 if __name__ == "__main__":
     produce_messages()

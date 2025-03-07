@@ -9,7 +9,6 @@
 **/*.log
 **/.env
 **/secrets
-**/data
 **/airflow/logs
 **/infrastructure/.terraform
 **/infrastructure/*.tfstate

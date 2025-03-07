@@ -1,27 +1,35 @@
 {
-  "version": 1,
-  "disable_existing_loggers": false,
-  "formatters": {
+    "version": 1,
+    "disable_existing_loggers": false,
+    "formatters": {
       "json": {
-          "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
-          "format": "%(asctime)s %(levelname)s %(message)s %(module)s %(lineno)d"
+        "()": "pythonjsonlogger.jsonlogger.JsonFormatter",
+        "format": "%(asctime)s %(levelname)s %(message)s %(module)s %(lineno)d"
       }
-  },
-  "handlers": {
+    },
+    "handlers": {
       "console": {
-          "class": "logging.StreamHandler",
-          "formatter": "json",
-          "stream": "ext://sys.stdout"
+        "class": "logging.StreamHandler",
+        "formatter": "json",
+        "stream": "ext://sys.stdout"
       },
       "logstash": {
-          "class": "logging.handlers.SocketHandler",
-          "host": "logstash",
-          "port": 5000,
-          "formatter": "json"
+        "class": "logging.handlers.SocketHandler",
+        "host": "logstash",
+        "port": 5000,
+        "formatter": "json"
+      },
+      "task": {
+        "class": "logging.handlers.RotatingFileHandler",
+        "formatter": "json",
+        "filename": "/logs/tasks.log",
+        "mode": "a",
+        "maxBytes": 1000000,
+        "backupCount": 5
       }
-  },
-  "root": {
+    },
+    "root": {
       "level": "INFO",
-      "handlers": ["console", "logstash"]
+      "handlers": ["console", "logstash", "task"]
+    }
   }
-}

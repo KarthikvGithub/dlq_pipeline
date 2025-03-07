@@ -2,18 +2,31 @@ import os
 import boto3
 import kagglehub
 from pathlib import Path
+import shutil
+from utils import parse_aws_config
 from botocore.exceptions import NoCredentialsError, ClientError
 
+# **/data
+
+
 # Configuration
-S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'nyc-taxi-dlq-data')
-S3_PREFIX = 'raw/'
 LOCAL_DATA_DIR = Path('./data/')
 DATASET_HANDLE = "elemento/nyc-yellow-taxi-trip-data"
 
+
 def upload_to_s3(local_path: Path):
+    if not any(local_path.glob('*')):
+        print("No files found to upload.")
+        print(local_path)
+        return
+    aws_credentials = parse_aws_config()
     s3 = boto3.client('s3',
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
+        aws_access_key_id=aws_credentials['AWS_ACCESS_KEY_ID'],
+        aws_secret_access_key=aws_credentials['AWS_SECRET_ACCESS_KEY']
+    )
+
+    S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'dlq-pipeline-source-data')
+    S3_PREFIX = 'raw/'
     
     for file in local_path.glob('**/*'):
         if file.is_file() and file.suffix in ['.csv', '.parquet']:
@@ -35,14 +48,17 @@ def ensure_data_available():
     if not existing_files:
         print("Downloading dataset from Kaggle...")
         dataset_path = kagglehub.dataset_download(DATASET_HANDLE)
+        dataset_path = Path(dataset_path)
         print(f"Dataset downloaded to: {dataset_path}")
         
-        # Handle Kaggle's zip format
-        if str(dataset_path).endswith('.zip'):
-            from zipfile import ZipFile
-            with ZipFile(dataset_path, 'r') as zip_ref:
-                zip_ref.extractall(LOCAL_DATA_DIR)
-            os.remove(dataset_path)
+        if not os.path.exists(dataset_path):
+            print("Dataset not downloaded. Check Kaggle credentials.")
+            return
+
+        for file in dataset_path.glob("**/*"):
+            if file.is_file() and file.suffix in ['.csv', '.parquet']:
+                shutil.copy(file, LOCAL_DATA_DIR)
+                print(f"Copied {file.name} to {LOCAL_DATA_DIR}")
     else:
         print(f"Using existing local data in {LOCAL_DATA_DIR}")
 

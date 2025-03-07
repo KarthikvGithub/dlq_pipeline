@@ -3,9 +3,9 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import datetime, timedelta
-from src.dlq_consumer import consume_dlq_messages
-from src.kafka_consumer import consume_messages
-from src.utils import log_to_elasticsearch
+from dlq_consumer import consume_dlq_messages
+from kafka_consumer import consume_messages
+from utils import log_to_elasticsearch
 import logging
 import os
 

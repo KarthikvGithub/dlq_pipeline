@@ -1,17 +1,15 @@
 import json
 import logging
 import logging.config
-import uuid
 import os
 import time
 import boto3
 import requests
-from pyspark.sql.functions import udf
-from pyspark.sql.types import BooleanType, StringType, StructType, StructField, IntegerType, FloatType, TimestampType
-from jsonschema import validate
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, TimestampType, StringType
 from pathlib import Path
 from botocore.exceptions import ClientError
-from typing import Dict, Any, Optional
+from typing import Optional
 from datetime import datetime
 
 # Load schema from config file
@@ -47,88 +45,105 @@ spark_schema = StructType([
     StructField("tolls_amount", FloatType()),
     StructField("improvement_surcharge", FloatType()),
     StructField("total_amount", FloatType()),
-    StructField("retry_count", IntegerType()) 
+    StructField("retry_count", IntegerType())
 ])
 
-@udf(returnType=BooleanType())
-def validate_schema_udf(record_json: str) -> bool:
-    """Spark UDF for schema validation."""
-    try:
-        record = json.loads(record_json)
-        validate(instance=record, schema=SCHEMA['schema'])
-        return True
-    except Exception as e:
-        logger.error(f"Validation failed: {str(e)}")
-        return False
+# def validate_schema(df):
+#     """Native Spark schema validation using DataFrame operations"""
+#     return df.filter(
+#         F.col("VendorID").isNotNull() &
+#         F.col("tpep_pickup_datetime").isNotNull() &
+#         F.col("tpep_dropoff_datetime").isNotNull() &
+#         F.col("passenger_count").between(0, 9) &
+#         F.col("fare_amount").geq(0) &
+#         F.col("total_amount").geq(0) &
+#         F.col("RateCodeID").isin([1, 2, 3, 4, 5, 6]) &
+#         F.col("store_and_fwd_flag").isin(["Y", "N"])
+#     )
 
-@udf(returnType=StringType())
-def apply_corrections_udf(record_json: str) -> str:
-    """Spark UDF for applying corrections."""
-    try:
-        record = json.loads(record_json)
-        numeric_fields = [
-            "VendorID", "passenger_count", "trip_distance",
-            "pickup_longitude", "pickup_latitude", "RateCodeID",
-            "dropoff_longitude", "dropoff_latitude", "payment_type",
-            "fare_amount", "extra", "mta_tax", "tip_amount",
-            "tolls_amount", "improvement_surcharge", "total_amount"
-        ]
+def parse_aws_config(filepath="/run/secrets/aws_config"):
+    aws_config = {}
+    with open(filepath, "r") as f:
+        for line in f:
+            key, value = line.strip().split("=", 1)
+            aws_config[key] = value
+    return aws_config
 
-        for field in numeric_fields:
-            if field in record:
-                value = record[field]
-                if isinstance(value, str):
-                    value = value.replace('$', '').replace(',', '')
-                    if value.strip() == '':
-                        value = '0'
-                    if value.startswith('.'):
-                        value = '0' + value
-                    
-                    try:
-                        record[field] = float(value)
-                        if field in ["VendorID", "passenger_count", "RateCodeID", "payment_type"]:
-                            record[field] = int(float(value))
-                    except ValueError:
-                        record[field] = 0.0
+def get_validation_condition():
+    """Native Spark validation conditions"""
+    return (
+        (F.col("VendorID").isNotNull()) 
+        & (F.col("tpep_pickup_datetime").isNotNull())
+        & (F.col("tpep_dropoff_datetime").isNotNull())
+        & (F.col("passenger_count").between(0, 9))
+        & ((F.col("fare_amount") >= 0))
+        & ((F.col("total_amount") >= 0))
+        & (F.col("RateCodeID").isin([1, 2, 3, 4, 5, 6]))
+        & (F.col("store_and_fwd_flag").isin(["Y", "N"]))
+    )
 
-        record['fare_amount'] = abs(record.get('fare_amount', 0))
+
+def apply_corrections(df):
+    """Native Spark data transformations"""
+    numeric_fields = [
+        "VendorID", "passenger_count", "trip_distance",
+        "pickup_longitude", "pickup_latitude", "RateCodeID",
+        "dropoff_longitude", "dropoff_latitude", "payment_type",
+        "fare_amount", "extra", "mta_tax", "tip_amount",
+        "tolls_amount", "improvement_surcharge", "total_amount"
+    ]
+    
+    # Clean numeric fields
+    for field in numeric_fields:
+        df = df.withColumn(field, 
+            F.regexp_replace(F.col(field).cast("string"), "[^0-9.-]", "")
+            .cast(FloatType())
+        )
         
-        if 'uuid' not in record:
-            record['uuid'] = str(uuid.uuid4())
-        
-        return json.dumps(record)
-    except Exception as e:
-        logger.error(f"Correction failed: {str(e)}")
-        return record_json
+    # Special handling for integer fields
+    for field in ["VendorID", "passenger_count", "RateCodeID", "payment_type"]:
+        df = df.withColumn(field, F.coalesce(F.col(field).cast(IntegerType()), F.lit(0)))
+    
+    # Absolute value for fare amount
+    df = df.withColumn("fare_amount", F.abs(F.col("fare_amount")))
+    
+    # Generate UUID
+    return df.withColumn("uuid", F.expr("uuid()"))
 
-@udf(returnType=StringType())
-def log_to_elasticsearch_udf(record_json: str, event_type: str) -> str:
-    """Spark UDF for logging to Elasticsearch."""
-    try:
-        record = json.loads(record_json)
-        log_entry = {
+def batch_log_to_elasticsearch(df, batch_id):
+    """Batch process records for Elasticsearch using foreachBatch"""
+    es_endpoint = os.getenv('ELASTICSEARCH_ENDPOINT', 'http://elasticsearch:9200')
+    headers = {"Content-Type": "application/x-ndjson"}
+    
+    # Convert DataFrame to JSON records
+    records = [row.asDict() for row in df.collect()]
+    
+    # Prepare bulk request
+    bulk_data = []
+    for record in records:
+        bulk_data.append(json.dumps({"index": {}}))
+        bulk_data.append(json.dumps({
             "@timestamp": datetime.utcnow().isoformat(),
             "level": "INFO",
             "message": "DLQ processing event",
             "data": {
-                "event": event_type,
+                "event": "stream_processing",
                 "record": record,
                 "timestamp": int(time.time() * 1000)
             }
-        }
-        
-        es_endpoint = os.getenv('ELASTICSEARCH_ENDPOINT', 'http://elasticsearch:9200')
+        }))
+    
+    # Send bulk request
+    try:
         response = requests.post(
-            f"{es_endpoint}/dlq-logs/_doc",
-            json=log_entry,
-            headers={"Content-Type": "application/json"},
-            timeout=5
+            f"{es_endpoint}/_bulk",
+            data="\n".join(bulk_data),
+            headers=headers,
+            timeout=10
         )
         response.raise_for_status()
-        return "success"
     except Exception as e:
-        logger.error(f"Failed to log to Elasticsearch: {e}")
-        return f"error: {str(e)}"
+        logger.error(f"Batch {batch_id} failed: {str(e)}")
 
 def upload_to_s3(file_path: str, bucket: str, s3_key: str) -> bool:
     s3 = boto3.client('s3',
